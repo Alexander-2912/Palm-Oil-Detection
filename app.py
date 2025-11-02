@@ -47,34 +47,34 @@ PIXEL_AREA_M2 = 100.0
 # Jika None, nanti dibaca dari geotransform raster.
 
 # ====================== UTIL / HELPER ======================
-def scale_per_band_valid(arr, nodata, low=2, high=98):
-    # Mendefinisikan fungsi untuk menormalkan nilai citra per-band ke rentang [0, 1] memakai persentil.
-    x = arr.astype("float32")
-    # konversi array input ke float32 untuk presisi
-    if x.ndim == 2: x = x[..., None]
-    # Jika input 2D (H×W), tambahkan dimensi channel di belakang ⇒ (H×W×1).
-    if nodata is not None:
-        #Jika ada nilai NoData yang didefinisikan
-        for c in range(x.shape[-1]):
-        # Loop tiap channel c.
-            band = x[..., c]
-            # Ambil view band ke-c (band adalah view ke x[..., c]).
-            band[band == nodata] = np.nan
-            # Ganti semua piksel yang persis sama dengan nodata menjadi NaN.
-    out = np.empty_like(x)
-    # Inisialisasi array output dengan bentuk dan tipe yang sama seperti x.
-    for c in range(x.shape[-1]):
-    # Loop tiap channel c.
-        band = x[..., c]
-        # Ambil view band ke-c (band adalah view ke x[..., c]).
-        lo = np.nanpercentile(band, low)
-        hi = np.nanpercentile(band, high)
-        # Hitung persentil bawah/atas (mis. 2% & 98%) dengan mengabaikan NaN
-        out[..., c] = np.clip((band-lo)/(hi-lo+1e-6), 0, 1)
-        # band - lo = menggeser nilai citra supaya batas bawah (lo) menjadi nol.
-        # (hi - lo + 1e-6) = skala rentang nilai citra supaya batas atas (hi) menjadi 1.
-    return np.nan_to_num(out, nan=0.0)
-    # Mengembalikan array float32 bernilai di [0, 1] per band, tanpa NaN.
+# def scale_per_band_valid(arr, nodata, low=2, high=98):
+#     # Mendefinisikan fungsi untuk menormalkan nilai citra per-band ke rentang [0, 1] memakai persentil.
+#     x = arr.astype("float32")
+#     # konversi array input ke float32 untuk presisi
+#     if x.ndim == 2: x = x[..., None]
+#     # Jika input 2D (H×W), tambahkan dimensi channel di belakang ⇒ (H×W×1).
+#     if nodata is not None:
+#         #Jika ada nilai NoData yang didefinisikan
+#         for c in range(x.shape[-1]):
+#         # Loop tiap channel c.
+#             band = x[..., c]
+#             # Ambil view band ke-c (band adalah view ke x[..., c]).
+#             band[band == nodata] = np.nan
+#             # Ganti semua piksel yang persis sama dengan nodata menjadi NaN.
+#     out = np.empty_like(x)
+#     # Inisialisasi array output dengan bentuk dan tipe yang sama seperti x.
+#     for c in range(x.shape[-1]):
+#     # Loop tiap channel c.
+#         band = x[..., c]
+#         # Ambil view band ke-c (band adalah view ke x[..., c]).
+#         lo = np.nanpercentile(band, low)
+#         hi = np.nanpercentile(band, high)
+#         # Hitung persentil bawah/atas (mis. 2% & 98%) dengan mengabaikan NaN
+#         out[..., c] = np.clip((band-lo)/(hi-lo+1e-6), 0, 1)
+#         # band - lo = menggeser nilai citra supaya batas bawah (lo) menjadi nol.
+#         # (hi - lo + 1e-6) = skala rentang nilai citra supaya batas atas (hi) menjadi 1.
+#     return np.nan_to_num(out, nan=0.0)
+#     # Mengembalikan array float32 bernilai di [0, 1] per band, tanpa NaN.
 
 def pad_to_multiple(img, multiple=32):
     # Mendefinisikan fungsi untuk menambah padding di bawah & kanan citra 
@@ -188,24 +188,33 @@ def apply_gamma(img01, gamma=1.5):
 
 # ---- luas piksel dan hitung area ----
 def pixel_area_m2_from_tif(tif_path: str, PIXEL_AREA_M2) -> float:
-    """
-    Ambil luas piksel (m²).
-    Jika PIXEL_AREA_M2 != None → gunakan nilai tersebut.
-    Jika None → baca dari GeoTransform (|a*e|). Jika tidak valid → fallback.
-    """
-
     with rasterio.open(tif_path) as ds:
-        a = float(ds.transform.a)
-        e = float(ds.transform.e)
+    # buka raster dengan rasterio
+        a = float(ds.transform.a) # ukuran piksel di arah x
+        e = float(ds.transform.e) # ukuran pixel di arah y
+        # ambil elemen a (skala x) dan e (skala y) dari affine transform
+        # affine(a, b, c / d, e, f) -> a(x) dan e(y) itu skala piksel di x (lebar) dan y (tinggi)
+        # c dan f adalah koordinat x dan y
+        # b dan d nol karena tidak ada rotasi
+
+        # a untuk lebar
+        # e untuk tinggi
+
         area = abs(a * e)
+        # hitung luas piksel (m²) sebagai |a × e|
+
         if not np.isfinite(area) or area <= 0:
+            # jika area tidak valid (NaN, Inf, ≤0), pakai nilai paksa
             area = float(PIXEL_AREA_M2)
         return area
 
 def count_pixels_eq1(tif_path: str) -> int:
     with rasterio.open(tif_path) as ds:
+        # membuka file raster dengan rasterio
         arr = ds.read(1)
+        # membaca band 1 ke dalam array NumPy
         return int((arr == 1).sum())
+        # menghitung jumlah piksel dengan nilai 1 dan mengembalikannya sebagai integer
 
 def fmt_area_triple(m2: float) -> str:
     ha  = m2 / 10_000.0
@@ -224,8 +233,9 @@ def load_model_cached(model_path: str):
     return load_model(model_path, compile=False)
 
 # ---- Prediksi windowed ----
-def predict_full_raster(raster_path, model, in_ch=3, tile=256, overlap=64, multiple=32, disp_bands=(1,2,3)):
+def predict_full_raster(raster_path, model, in_ch=3, tile=256, overlap=64, multiple=32, disp_bands=(1,2,3), global_lows=None, global_highs=None):
     assert tile % multiple == 0 and 0 <= overlap < tile
+    assert global_lows is not None and global_highs is not None
     # pastikan tile kelipatan multiple, dan overlap tidak negatid dan lebih kecil dari tile
 
     with rasterio.open(raster_path) as src:
@@ -275,7 +285,12 @@ def predict_full_raster(raster_path, model, in_ch=3, tile=256, overlap=64, multi
                     # tambahkan nilai 1.0 ke setiap elemen di area [y:y+hh, x:x+ww, :] dari array weight.
                     continue
 
-                patch01 = scale_per_band_valid(patch, nodata, 2, 98)
+                # lewati nodata → 0 dulu agar tidak ganggu scaling
+                if nodata is not None:
+                    patch = patch.astype(np.float32)
+                    patch[patch == nodata] = 0.0
+
+                patch01 = scale_fixed_minmax(patch, global_lows, global_highs)
                 # skala patch ke 0-1 per band dengan persentil 2-98
                 patch_pad, _  = pad_to_multiple(patch01, multiple=multiple)
                 # pad patch agar kelipatan multiple
@@ -361,112 +376,164 @@ def save_mask_geotiff_like(ref_path, mask01, out_path, nodata=0, compress="lzw")
 
 # ---- Visual PNG (citra asli & overlay) ----
 def _vis_global_gamma(a, lows, highs, gamma=1.5):
+    # a array citra input
     vis01 = scale_fixed_minmax(a, lows, highs)
-    if vis01.shape[-1] == 1:
-        vis01 = np.repeat(vis01, 3, axis=-1)
+    # skala piksel ke 0-1 menggunakan low dan high (percentil)
+    # if vis01.shape[-1] == 1:
+        # cek jumlah channel
+        # vis01 = np.repeat(vis01, 3, axis=-1)
+        # jika 1 channel, ulangi jadi 3 channel (grayscale ke RGB)
     return apply_gamma(vis01, gamma=gamma)
 
-def save_png_preview_from_tif(tif_path, out_png, lows, highs, max_side=2000, is_mask=False):
+def save_png_preview_from_tif(tif_path, out_png, lows, highs, max_side=2000):
     with rasterio.open(tif_path) as src:
+        # membuka raster
         H, W = src.height, src.width
+        # ambil dimensi tinggi dan lebar dari raster
         scale = max(H/max_side, W/max_side, 1.0)
+        # digunakan untuk mengecilkan gambar besar agar tidak melebihi max_side
+        # ambil yang terbesar dari ketiganya
         dH, dW = int(H/scale), int(W/scale)
-
-        if is_mask:
-            a = src.read(1, out_shape=(dH, dW), resampling=Resampling.nearest).astype(np.uint8)
-            img = Image.fromarray(a, mode="P")
-            palette = [0,0,0, 255,248,113] + [0,0,0]*254
-            img.putpalette(palette)
-            img.save(out_png, optimize=True, transparency=0)
-        else:
-            idxs = [1,2,3] if src.count >= 3 else [1]
-            a = src.read(indexes=idxs, out_shape=(len(idxs), dH, dW),
-                         resampling=Resampling.bilinear).transpose(1,2,0)
-            vis01 = _vis_global_gamma(a, lows, highs, gamma=1.5)
-            Image.fromarray((np.clip(vis01,0,1)*255).astype(np.uint8), mode="RGB").save(out_png, optimize=True)
+        #dh, dw ukuran baru pake scale
+        idxs = [1,2,3] if src.count >= 3 else [1]
+        # tentukan band yang akan dibaca (RGB jika ada ≥3 band, else band 1)
+        a = src.read(indexes=idxs, out_shape=(len(idxs), dH, dW),
+                     resampling=Resampling.bilinear).transpose(1,2,0)
+        # membaca band yang dipilih dengan ukuran diubah ke (dH, dW) menggunakan resampling bilinear > (C, dH, dW) → (dH, dW, C)
+        vis01 = _vis_global_gamma(a, lows, highs, gamma=1.5)
+        Image.fromarray((np.clip(vis01,0,1)*255).astype(np.uint8), mode="RGB").save(out_png, optimize=True)
+        # np.clip mastiin nilai tetap di 0-1, terus diubah jadi 0-255
+        # optimize=True supaya PNG lebih kecil ukurannya
 
 def save_overlay_png_from_tif(base_tif, mask_tif, out_png, lows, highs,
                               max_side=2000, color_fg=(0, 255, 0), color_bg=(255, 0, 0), alpha=0.65):
+    # color_fg buat warna overlay mask == 1 (default hijau)
+    # color_bg buat warna overlay mask == 0 (default merah)
+    # alpha buat transparansi
     with rasterio.open(base_tif) as src_b:
         Hb, Wb = src_b.height, src_b.width
         scale = max(Hb/max_side, Wb/max_side, 1.0)
         dH, dW = int(Hb/scale), int(Wb/scale)
+        # sama kayak yang diatas
 
-        if src_b.count >= 3:
-            idxs = [1,2,3]
-            base_raw = src_b.read(indexes=idxs, out_shape=(len(idxs), dH, dW),
-                                  resampling=Resampling.bilinear).transpose(1,2,0)
-        else:
-            base1 = src_b.read(1, out_shape=(dH, dW), resampling=Resampling.bilinear)
-            base_raw = np.repeat(base1[..., None], 3, axis=-1)
-
-        if src_b.nodata is not None:
-            band1_small = src_b.read(1, out_shape=(dH, dW), resampling=Resampling.nearest)
-            valid = (band1_small != src_b.nodata)
-        else:
-            valid = np.any(base_raw != 0, axis=-1)
+        idxs = [1,2,3]
+        base_raw = src_b.read(indexes=idxs, out_shape=(len(idxs), dH, dW),
+                              resampling=Resampling.bilinear).transpose(1,2,0)
+        # baca band RGB dengan resampling bilinear ke ukuran (dH, dW), kemudian di tranpose ke (H, W, C)
+        valid = np.any(base_raw != 0, axis=-1)
+        # buat mask valid (bukan hitam semua di RGB)
 
         base01 = _vis_global_gamma(base_raw, lows, highs, gamma=1.5)
+        # skala ke 0-1 dengan gamma untuk mencerahkan citra
         over   = (np.clip(base01, 0, 1) * 255.0).astype(np.float32)
+        # klip ke 0-1 kemudian diubah ke 0-255 float32 untuk overlay
 
     with rasterio.open(mask_tif) as src_m:
         mask_small = src_m.read(1, out_shape=(dH, dW), resampling=Resampling.nearest).astype(np.uint8)
+    # baca band 1 dari mask dan ubah ukuran dan esample ke (dH, dW) dengan resampling nearest (supaya nilai mask tetap utuh)
 
     rf,gf,bf = color_fg
     rb,gb,bb = color_bg
+    # pecah band masking ke warna depan dan belakang
     a = float(alpha)
+    # alpha sebagai float
 
+
+    # ngewarnain dengan merah dan hijau
     m1 = (mask_small == 1) & valid
+    # mask untuk piksel dengan mask == 1 dan valid (bukan area kosong)
     if m1.any():
         over[m1, 0] = (1 - a) * over[m1, 0] + a * rf
         over[m1, 1] = (1 - a) * over[m1, 1] + a * gf
         over[m1, 2] = (1 - a) * over[m1, 2] + a * bf
+        # out = (1-α) * base + α * color
 
     m0 = (mask_small == 0) & valid
+    # mask untuk piksel dengan mask == 0 dan valid
     if m0.any():
         over[m0, 0] = (1 - a) * over[m0, 0] + a * rb
         over[m0, 1] = (1 - a) * over[m0, 1] + a * gb
         over[m0, 2] = (1 - a) * over[m0, 2] + a * bb
 
     Image.fromarray(np.clip(over, 0, 255).astype(np.uint8), mode="RGB").save(out_png, optimize=True)
+    # pastiin nilai 0-255, ubah ke uint8, simpan PNG
 
 # ---- Polygonize mask menjadi Shapefile ----
 def mask_tif_to_shapefile(mask_tif_path, shp_out_path, only_value=1, dissolve=False):
     with rasterio.open(mask_tif_path) as ds:
         arr = ds.read(1)
+        # baca band 1 ke array 2D
         tr  = ds.transform
+        # ambil affine transform untuk memetakan koordinat piksel
+        # ambil elemen a (skala x) dan e (skala y) dari affine transform
+        # affine(a, b, c / d, e, f) -> a(x) dan e(y) itu skala piksel di x (lebar) dan y (tinggi)
+        # c dan f adalah koordinat x dan y
+        # b dan d nol karena tidak ada rotasi
         crs = ds.crs
+        # ambil CRS dari metadata raster (bisa None, mis. UTM EPSG:xxxxx)
 
     polys = [shp_shape(geom) for geom, val in shapes(arr, mask=(arr == only_value), transform=tr)
              if int(val) == int(only_value)]
+    # shapes(arr, mask=..., transform=tr) menghasilkan generator (geom (geometri poligon dalam format json), val (nilai piksel))
+    # hanya poligon dengan nilai piksel == only_value (true) yang diambil 
+    # transform=tr untuk memetakan koordinat piksel ke koordinat dunia
+    # shp_shape (geom) mengubah geometri GeoJSON ke Shapely polygon
+    # if int(val) == int(only_value): filter tambahan untuk memastikan hanya nilai target yang disimpan (aman kalau arr bertipe float/uint)
+    # Hasilnya: polys adalah list Shapely polygon untuk area bernilai only_value.
 
     gdf = gpd.GeoDataFrame({"value":[only_value]*len(polys)}, geometry=polys, crs=crs)
+    # Buat GeoDataFrame dari daftar poligon.
+    # kolom atribut value diisi only_value untuk setiap baris.
+    # geometry=polys: set kolom geometri dari Shapely objects.
+    # crs=crs: wariskan CRS raster agar shapefile tergeoreferensi.
+
     if gdf.empty:
+        # Jika tidak ada piksel bernilai only_value → polys kosong → gdf.empty.
         gdf = gpd.GeoDataFrame({"value":[], "area_m2":[]}, geometry=[], crs=crs)
+        # Buat GeoDataFrame kosong tapi dengan skema kolom yang diharapkan (value, area_m2) agar downstream aman.
         gdf.to_file(shp_out_path, driver="ESRI Shapefile")
+        # Tulis Shapefile kosong (akan tetap membuat berkas .shp/.shx/.dbf/.prj dengan skema).
         return shp_out_path
+        # Kembalikan path keluaran segera (tidak lanjut ke langkah hitung area/dissolve).
 
     gdf["area_m2"] = gdf.geometry.area.astype(float)
+    # Hitung luas tiap poligon pada kolom geometry.
+    # buat nyimpen koordinat dari setiap poligon dan ngitung luas dari masing-masing poligon yang berdampingan
     if dissolve:
         gdf = gdf.dissolve(by="value", as_index=False, aggfunc={"area_m2":"sum"})
+        # gabungkan semua poligon dengan nilai atribut "value" yang sama menjadi satu poligon tunggal.
+        # poligonnya ada banyak tapi dimasukkin ke satu file poligon
+        # luas area_m2 dijumlahkan untuk poligon yang digabungkan.
     gdf.to_file(shp_out_path, driver="ESRI Shapefile")
+    # shp menyimpan geometri
+    # shx indeks posisi geometri
+    # dbf tabel atribut kolom
+    # prj sistem koordinat
+    # cpg encoding karakter
     return shp_out_path
+    
 
 # ---- ZIP: mask TIF + shapefile + overlay + input asli ----
-def zip_mask_and_shapefile(mask_tif_path: str, shp_path: str, overlay_png: str = None, input_original: str = None) -> bytes:
+def zip_mask_and_shapefile(mask_tif_path: str, shp_path: str, overlay_png: str, input_original: str) -> bytes:
     buf = io.BytesIO()
+    # buat buffer in-memory untuk menyimpan ZIP
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # buat objek ZipFile untuk menulis ke buffer dengan kompresi DEFLATED agar lebih kecil
+        # w buat zip baru
         if os.path.isfile(mask_tif_path):
             zf.write(mask_tif_path, arcname=os.path.basename(mask_tif_path))
-        stem, _ = os.path.splitext(shp_path)
+        # masukkin file mask tif ke zip dengan nama file asli (tanpa path)
+        stem, _ = os.path.splitext(shp_path) #shp_path cuma ke yg .shp
+        # ambil path tanpa ekstensi dari shp_path
         for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg", ".sbn", ".sbx", ".qix", ".fix", ".xml"]:
             p = stem + ext
+            # ambil path lengkap untuk tiap ekstensi file shapefile
             if os.path.isfile(p):
                 zf.write(p, arcname=os.path.basename(p))
-        if overlay_png and os.path.isfile(overlay_png):
-            zf.write(overlay_png, arcname=os.path.basename(overlay_png))
-        if input_original and os.path.isfile(input_original):
-            zf.write(input_original, arcname=os.path.basename(input_original))
+                # masukkin file shapefile ke zip dengan nama file asli (tanpa path)
+        zf.write(overlay_png, arcname=os.path.basename(overlay_png))
+        zf.write(input_original, arcname=os.path.basename(input_original))
+        #masukkan file overlay dan input asli jika ada
     buf.seek(0)
     return buf.getvalue()
 
@@ -545,6 +612,8 @@ if view == "home":
 
 # ---------- HALAMAN: PENGUJIAN (inference) MULAI DARI SINI ----------
 def run_pipeline(file_bytes: bytes, filename: str, model_path: str):
+
+    
     # file disimpan ke temporary directory 
     work_dir = tempfile.mkdtemp(prefix="run_")
     in_path = os.path.join(work_dir, filename)
@@ -569,7 +638,7 @@ def run_pipeline(file_bytes: bytes, filename: str, model_path: str):
     # prediksi full raster
     prob = predict_full_raster(
         in_path, model, in_ch=IN_CH,
-        tile=TILE, overlap=OVERLAP, multiple=MULT, disp_bands=DISPLAY_BANDS
+        tile=TILE, overlap=OVERLAP, multiple=MULT, disp_bands=DISPLAY_BANDS, global_lows=GLOBAL_LOW, global_highs=GLOBAL_HIGH
     )
     mask = (prob[...,0] >= THRESH).astype(np.uint8)
     # Mengubah probabilitas jadi mask biner:
@@ -579,23 +648,35 @@ def run_pipeline(file_bytes: bytes, filename: str, model_path: str):
     save_mask_geotiff_like(in_path, mask, mask_tif_path, nodata=0)
 
     # Hitung luas area terdeteksi (mask==1)
-    px_area_m2   = pixel_area_m2_from_tif(mask_tif_path, PIXEL_AREA_M2)
+    # px_area_m2   = pixel_area_m2_from_tif(mask_tif_path, PIXEL_AREA_M2)
     n_pixels_pos = count_pixels_eq1(mask_tif_path)
-    area_m2      = n_pixels_pos * px_area_m2
+    area_m2      = n_pixels_pos * float(PIXEL_AREA_M2)
+    # hitung luas total dalam m²
     area_ha      = area_m2 / 10_000.0
+    # hitung luas total dalam hektar
     area_km2     = area_m2 / 1_000_000.0
+    # hitung luas total dalam km²
 
     shp_path = os.path.join(work_dir, "prediction_mask.shp")
     mask_tif_to_shapefile(mask_tif_path, shp_path, only_value=1, dissolve=True)
 
     png_rgb_path = os.path.join(work_dir, "input_preview_rgb.png")
+    # buat direktor baru untuk simpan preview PNG
+    # cuma buat preview di streamlit doang
     png_ovr_path = os.path.join(work_dir, "input_overlay.png")
-    save_png_preview_from_tif(in_path, png_rgb_path, GLOBAL_LOW, GLOBAL_HIGH, max_side=PNG_MAX_SIDE, is_mask=False)
+    # buat direktor baru untuk simpan overlay PNG
+    save_png_preview_from_tif(in_path, png_rgb_path, GLOBAL_LOW, GLOBAL_HIGH, max_side=PNG_MAX_SIDE)
     save_overlay_png_from_tif(in_path, mask_tif_path, png_ovr_path, GLOBAL_LOW, GLOBAL_HIGH, max_side=PNG_MAX_SIDE)
 
     with open(png_rgb_path, "rb") as f: png_rgb_bytes = f.read()
     with open(png_ovr_path, "rb") as f: png_ovr_bytes = f.read()
     with open(mask_tif_path, "rb") as f: mask_tif_bytes = f.read()
+    # mode rb supaya bener bacanya (binary)
+    # f.read mengembalikan isi file sebagai bytes
+    # hasilnya disimpan di variabel bytes
+
+    # karena png itu file biner, bukan teks (r)
+    # read dipake buat baca dari path (memori lokal) ke bytes (di ram), karena browser gaada akses ke path temporary
 
     zip_bytes = zip_mask_and_shapefile(mask_tif_path, shp_path,
                                        overlay_png=png_ovr_path, input_original=in_path)
@@ -610,7 +691,7 @@ def run_pipeline(file_bytes: bytes, filename: str, model_path: str):
         "mask_name": "prediction_mask.tif",
         # (BARU) metrik luas
         "n_pixels_pos": n_pixels_pos,
-        "pixel_area_m2": px_area_m2,
+        "pixel_area_m2": float(PIXEL_AREA_M2),
         "area_m2": area_m2,
         "area_ha": area_ha,
         "area_km2": area_km2,
