@@ -2,6 +2,7 @@
 import os, io, tempfile, zipfile, warnings, hashlib
 import numpy as np
 import streamlit as st
+import pandas as pd
 from PIL import Image
 
 import tensorflow as tf
@@ -75,6 +76,29 @@ PIXEL_AREA_M2 = 100.0
 #         # (hi - lo + 1e-6) = skala rentang nilai citra supaya batas atas (hi) menjadi 1.
 #     return np.nan_to_num(out, nan=0.0)
 #     # Mengembalikan array float32 bernilai di [0, 1] per band, tanpa NaN.
+
+# ===== add near other helpers =====
+# warna lembut (silakan ganti kalau mau)
+COLOR_NONPALM = (220, 70, 60)    # merah lembut (kelas 0)
+COLOR_PALM    = (0, 255, 0)  # hijau lembut (kelas 1)
+
+def save_mask_png(mask_uint8, out_png, transparent_value=255):
+    """
+    mask_uint8: array 2D berisi {0=non-sawit, 1=sawit, 255=NoData}
+    out_png   : path file png tujuan
+    """
+    pal = [0]*768  # 256*3
+    pal[0:3]   = COLOR_NONPALM          # index 0 -> merah lembut
+    pal[3:6]   = COLOR_PALM             # index 1 -> hijau lembut
+    # sisanya biarkan hitam
+
+    img = Image.fromarray(mask_uint8.astype("uint8"), mode="P")
+    img.putpalette(pal)
+    # bikin nilai 255 transparan (area di luar citra)
+    if transparent_value is not None:
+        img.info["transparency"] = transparent_value
+    img.save(out_png, optimize=True)
+
 
 def pad_to_multiple(img, multiple=32):
     # Mendefinisikan fungsi untuk menambah padding di bawah & kanan citra 
@@ -319,60 +343,52 @@ def predict_full_raster(raster_path, model, in_ch=3, tile=256, overlap=64, multi
         return prob
 
 # ---- Tulis mask GeoTIFF mengikuti metadata referensi ----
-def save_mask_geotiff_like(ref_path, mask01, out_path, nodata=0, compress="lzw"):
-    # ref_path: path raster referensi (citra input) untuk mengambil CRS & transform.
-    # compress: skema kompresi GeoTIFF (default "lzw").
-    if mask01.ndim == 3: mask01 = mask01[..., 0]
-    # Jika mask berdimensi 3 (H,W,1), ambil channel pertama → jadi 2D (H,W). 
-    # Penyederhanaan karena GeoTIFF yang ditulis hanya 1 band.
+def save_mask_geotiff_like(ref_path, mask01, out_path, nodata=255, compress="lzw"):
+    if mask01.ndim == 3:
+        mask01 = mask01[..., 0]
     mask01 = mask01.astype(np.uint8)
 
     with rasterio.open(ref_path) as src:
-        src_prof = src.profile.copy()
-        # salin profil (metadata) dari raster referensi
-        crs = src_prof.get("crs", None)
-        # ambil CRS dari profil (bisa None, mis. UTM EPSG:xxxxx)
-        transform = src_prof.get("transform", src.transform)
-        # ambil transform dari profil (jika tidak ada, pakai src.transform langsung)
+        crs = src.crs
+        transform = src.transform
         height, width = mask01.shape
-        # ambil tinggi dan lebar dari mask01
 
     prof = {
         "driver": "GTiff",
         "height": height,
         "width": width,
-        "count": 1, # hanya 1 band
+        "count": 1,
         "dtype": rasterio.uint8,
-        "crs": crs, 
-        "transform": transform, 
-        "compress": compress, # kompresi LZW
-        "BIGTIFF": "IF_SAFER", # aktifkan BigTIFF otomatis jika ukuran > 4GB.
-        "tiled": True, # penyimpanan bertipe tile
+        "crs": crs,
+        "transform": transform,
+        "compress": compress,
+        "BIGTIFF": "IF_SAFER",
+        "tiled": True,
         "blockxsize": 256,
         "blockysize": 256,
         "interleave": "pixel",
-        "photometric": "MINISBLACK", # 0 dianggap gelap, nilai lebih tinggi lebih terang
-        "nodata": nodata,
+        "photometric": "MINISBLACK",
+        "nodata": nodata,       # <-- 255
     }
 
     with rasterio.open(out_path, "w", **prof) as dst:
-    # Python akan melakukan “argument unpacking”, artinya:
-    # dictionary prof dipecah menjadi serangkaian argumen keyword.
         dst.write(mask01, 1)
-        # dst.write(mask01, 1) → tulis array ke band 1.
+        # 0=non-sawit (MERAH), 1=sawit (KUNING), 255=NoData (transparan)
         try:
-            dst.write_colormap(1, {0: (0, 0, 0, 0), 1: (255, 248, 113, 255)})
-            # dst.write_colormap(1, {...}) → pasang colormap untuk band 1:
+            dst.write_colormap(1, {
+                0:   (220,  70,  60, 255),
+                1:   (0, 255, 0, 255),
+                255: (0,    0,   0,   0),  # transparan
+            })
         except Exception:
             pass
 
     if BUILD_OVERVIEWS:
         with rasterio.open(out_path, "r+") as dst:
-            # Mode "r+" → buka untuk read/write metadata tambahan.
             dst.build_overviews([2, 4, 8, 16, 32], resampling=Resampling.nearest)
-            # build_overviews([2,4,8,16,32], ...) → buat pyramid pada faktor downsample 2×, 4×, 8×, 16×, 32×.
-            # Resampling.nearest → tepat untuk mask (kategorikal); menghindari interpolasi nilai
             dst.update_tags(ns="rio_overview", resampling="nearest")
+
+
 
 # ---- Visual PNG (citra asli & overlay) ----
 def _vis_global_gamma(a, lows, highs, gamma=1.5):
@@ -514,26 +530,21 @@ def mask_tif_to_shapefile(mask_tif_path, shp_out_path, only_value=1, dissolve=Fa
     
 
 # ---- ZIP: mask TIF + shapefile + overlay + input asli ----
-def zip_mask_and_shapefile(mask_tif_path: str, shp_path: str, overlay_png: str, input_original: str) -> bytes:
+def zip_mask_and_shapefile(mask_tif_path: str, shp_path: str, overlay_png: str,
+                           input_original: str, mask_png_path: str | None = None) -> bytes:
     buf = io.BytesIO()
-    # buat buffer in-memory untuk menyimpan ZIP
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        # buat objek ZipFile untuk menulis ke buffer dengan kompresi DEFLATED agar lebih kecil
-        # w buat zip baru
         if os.path.isfile(mask_tif_path):
             zf.write(mask_tif_path, arcname=os.path.basename(mask_tif_path))
-        # masukkin file mask tif ke zip dengan nama file asli (tanpa path)
-        stem, _ = os.path.splitext(shp_path) #shp_path cuma ke yg .shp
-        # ambil path tanpa ekstensi dari shp_path
+        if mask_png_path and os.path.isfile(mask_png_path):                      # <<< BARU
+            zf.write(mask_png_path, arcname=os.path.basename(mask_png_path))     # <<< BARU
+        stem, _ = os.path.splitext(shp_path)
         for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg", ".sbn", ".sbx", ".qix", ".fix", ".xml"]:
             p = stem + ext
-            # ambil path lengkap untuk tiap ekstensi file shapefile
             if os.path.isfile(p):
                 zf.write(p, arcname=os.path.basename(p))
-                # masukkin file shapefile ke zip dengan nama file asli (tanpa path)
         zf.write(overlay_png, arcname=os.path.basename(overlay_png))
         zf.write(input_original, arcname=os.path.basename(input_original))
-        #masukkan file overlay dan input asli jika ada
     buf.seek(0)
     return buf.getvalue()
 
@@ -543,12 +554,21 @@ def zip_mask_and_shapefile(mask_tif_path: str, shp_path: str, overlay_png: str, 
 
 
 
+
 # ====================== UI / ROUTING ======================
 st.set_page_config(page_title="Deteksi Sawit – U-Net ResNet", layout="wide")
+if "results" not in st.session_state:
+    st.session_state["results"] = []
+
+if "hasil_nonce" not in st.session_state:
+    st.session_state["hasil_nonce"] = 0
 
 # gunakan query param untuk "routing" internal
 qp = st.query_params
 view = qp.get("view", "home")
+
+if view != "hasil" and "results" in st.session_state:
+    st.session_state.pop("results", None)
 
 # ---------- SIDEBAR NAV (sesuai mockup) ----------
 st.markdown(
@@ -640,22 +660,48 @@ def run_pipeline(file_bytes: bytes, filename: str, model_path: str):
         in_path, model, in_ch=IN_CH,
         tile=TILE, overlap=OVERLAP, multiple=MULT, disp_bands=DISPLAY_BANDS, global_lows=GLOBAL_LOW, global_highs=GLOBAL_HIGH
     )
-    mask = (prob[...,0] >= THRESH).astype(np.uint8)
-    # Mengubah probabilitas jadi mask biner:
+    mask = (prob[..., 0] >= THRESH).astype(np.uint8)
+
+    # Buat valid mask dari citra input (alpha/bitmask internal)
+    with rasterio.open(in_path) as src:
+        valid_full = (src.read_masks(1) > 0)
+
+    # Jadikan area di luar citra = 255 (NoData)
+    mask_export = mask.copy()
+    mask_export[~valid_full] = 255
 
     mask_tif_path = os.path.join(work_dir, "prediction_mask.tif")
-    # Path output untuk GeoTIFF mask.
-    save_mask_geotiff_like(in_path, mask, mask_tif_path, nodata=0)
+    save_mask_geotiff_like(in_path, mask_export, mask_tif_path, nodata=255)
 
-    # Hitung luas area terdeteksi (mask==1)
-    # px_area_m2   = pixel_area_m2_from_tif(mask_tif_path, PIXEL_AREA_M2)
+    mask_png_path = os.path.join(work_dir, "prediction_mask.png")
+    save_mask_png(mask_export, mask_png_path, transparent_value=255)
+
+    # ================== STATISTIK PIXEL (SAWIT & NON-SAWIT) ==================
+    # Piksel sawit (mask == 1)
     n_pixels_pos = count_pixels_eq1(mask_tif_path)
-    area_m2      = n_pixels_pos * float(PIXEL_AREA_M2)
-    # hitung luas total dalam m²
+
+    # Piksel valid = hanya area citra (bukan putih/kosong)
+    # pakai read_masks seperti di skrip kedua kamu
+    with rasterio.open(mask_tif_path) as ds_mask:
+        valid_mask = ds_mask.read_masks(1) > 0
+        n_pixels_valid = int(valid_mask.sum())
+
+    # Piksel bukan kebun sawit (kelas 0 di area valid)
+    n_pixels_nonpalm = max(n_pixels_valid - n_pixels_pos, 0)
+
+    # Luas per piksel (dipaksa 100 m² seperti parameter global)
+    px_area_m2 = float(PIXEL_AREA_M2)
+
+    # Luas kebun sawit
+    area_m2      = n_pixels_pos * px_area_m2
     area_ha      = area_m2 / 10_000.0
-    # hitung luas total dalam hektar
     area_km2     = area_m2 / 1_000_000.0
-    # hitung luas total dalam km²
+
+    # Luas bukan kebun sawit (hanya area valid citra)
+    area_nonpalm_m2  = n_pixels_nonpalm * px_area_m2
+    area_nonpalm_ha  = area_nonpalm_m2 / 10_000.0
+    area_nonpalm_km2 = area_nonpalm_m2 / 1_000_000.0
+
 
     shp_path = os.path.join(work_dir, "prediction_mask.shp")
     mask_tif_to_shapefile(mask_tif_path, shp_path, only_value=1, dissolve=True)
@@ -679,7 +725,7 @@ def run_pipeline(file_bytes: bytes, filename: str, model_path: str):
     # read dipake buat baca dari path (memori lokal) ke bytes (di ram), karena browser gaada akses ke path temporary
 
     zip_bytes = zip_mask_and_shapefile(mask_tif_path, shp_path,
-                                       overlay_png=png_ovr_path, input_original=in_path)
+                                       overlay_png=png_ovr_path, input_original=in_path, mask_png_path=mask_png_path)
 
     return {
         "work_dir": work_dir,
@@ -689,13 +735,20 @@ def run_pipeline(file_bytes: bytes, filename: str, model_path: str):
         "zip_bytes": zip_bytes,
         "zip_name": f"{os.path.splitext(filename)[0]}_results.zip",
         "mask_name": "prediction_mask.tif",
-        # (BARU) metrik luas
+        # (BARU) metrik luas kebun sawit
         "n_pixels_pos": n_pixels_pos,
         "pixel_area_m2": float(PIXEL_AREA_M2),
         "area_m2": area_m2,
         "area_ha": area_ha,
         "area_km2": area_km2,
         "fmt_area": fmt_area_triple(area_m2),
+        # (BARU) metrik luas non-sawit di area valid
+        "n_pixels_valid": n_pixels_valid,
+        "n_pixels_nonpalm": n_pixels_nonpalm,
+        "area_nonpalm_m2": area_nonpalm_m2,
+        "area_nonpalm_ha": area_nonpalm_ha,
+        "area_nonpalm_km2": area_nonpalm_km2,
+        "filename": filename,
     }
 
 
@@ -712,18 +765,19 @@ if view == "pengujian":
     c1, c2 = st.columns(2)
     if c1.button("ResNet18", type="primary" if st.session_state.model_sel.endswith("res18_backbone_100epochs_256x192_compiled.hdf5") else "secondary"):
         st.session_state.model_sel = "models/res18_backbone_100epochs_256x192_compiled.hdf5"
-        st.session_state.pop("result", None)
     if c2.button("ResNet34", type="primary" if st.session_state.model_sel.endswith("res34_backbone_100epochs_256x192_compiled.hdf5") else "secondary"):
         st.session_state.model_sel = "models/res34_backbone_100epochs_256x192_compiled.hdf5"
-        st.session_state.pop("result", None)
+
+    year_peng = st.text_input("Tahun", placeholder="mis. 2019", key="year_pengujian")  # BARU
 
     st.subheader("Upload citra (TIF/JP2)")
     uploaded = st.file_uploader(" ", type=["tif","tiff","jp2"], accept_multiple_files=False, label_visibility="collapsed")
-    if uploaded is not None:
-        new_key = hashlib.md5(uploaded.getbuffer()).hexdigest() + "|" + st.session_state.model_sel
-        if st.session_state.get("last_key") != new_key:
-            st.session_state.pop("result", None)
-            st.session_state["last_key"] = new_key
+    # if uploaded is not None:
+    #     new_key = hashlib.md5(uploaded.getbuffer()).hexdigest() + "|" + st.session_state.model_sel
+    #     # membuat hash dari file dan  nama model
+    #     if st.session_state.get("last_key") != new_key:
+    #         st.session_state.pop("result", None)
+    #         st.session_state["last_key"] = new_key
 
     process = st.button("Proses", use_container_width=True, type="primary")
 
@@ -732,68 +786,232 @@ if view == "pengujian":
             st.error("Silakan upload 1 file citra terlebih dahulu.")
             st.stop()
         with st.spinner("Inferensi berjalan..."):
-            # manggil inference pipeline
-            st.session_state["result"] = run_pipeline(
-                uploaded.getbuffer(), uploaded.name, st.session_state.model_sel
-            )
+            res_new = run_pipeline(uploaded.getbuffer(), uploaded.name, st.session_state.model_sel)
+            yr = (st.session_state.get("year_pengujian", "") or "").strip()            # BARU
+            res_new["year"] = int(yr) if yr.isdigit() else None
+            # siapkan list results
+            if "results" not in st.session_state or not isinstance(st.session_state["results"], list):
+                st.session_state["results"] = []
+            st.session_state["results"].append(res_new)
         st.success("Selesai diproses.")
-        st.query_params["view"] = "hasil"   # tampilkan halaman hasil TANPA menu sidebar
+        st.query_params["view"] = "hasil"
         st.rerun()
 
 # ---------- HALAMAN: HASIL  ----------
 elif view == "hasil":
+    if "results" not in st.session_state:
+        st.session_state["results"] = []
     st.markdown("<h2 style='text-align:center'>Hasil Pengujian</h2>", unsafe_allow_html=True)
     st.divider()
 
-    res = st.session_state.get("result")
-    if res is None:
+    results = st.session_state.get("results", [])
+    if not results:
         st.warning("Belum ada hasil. Buka menu Pengujian untuk memproses citra.")
         if st.button("⬅️ Ke Pengujian", use_container_width=True):
             st.query_params["view"] = "pengujian"
             st.rerun()
         st.stop()
 
-    cA, cB = st.columns(2)
-    with cA:
-        st.subheader("Citra asli (preview)")
-        st.image(res["png_rgb_bytes"], use_container_width=True)
-    with cB:
-        st.subheader("Overlay")
-        st.image(res["png_ovr_bytes"], use_container_width=True)
+    # ================== FORM PENGUJIAN (SAMA PERSIS, SEKARANG DI HALAMAN HASIL) ==================
+    st.subheader("Pengujian")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.caption("Merah = bukan area kebun kelapa sawit")
-    with col2:
-        st.caption("Hijau = area kebun kelapa sawit")
+    # Model selector (pakai state global yang sama)
+    if "model_sel" not in st.session_state:
+        st.session_state.model_sel = "models/res18_backbone_100epochs_256x192_compiled.hdf5"
 
-    # (BARU) tampilkan metrik luas
+    cc1, cc2 = st.columns(2)
+    if cc1.button("ResNet18", key="hasil_res18_btn",
+                  type="primary" if st.session_state.model_sel.endswith("res18_backbone_100epochs_256x192_compiled.hdf5") else "secondary",
+                  use_container_width=True):
+        st.session_state.model_sel = "models/res18_backbone_100epochs_256x192_compiled.hdf5"
+    if cc2.button("ResNet34", key="hasil_res34_btn",
+                  type="primary" if st.session_state.model_sel.endswith("res34_backbone_100epochs_256x192_compiled.hdf5") else "secondary",
+                  use_container_width=True):
+        st.session_state.model_sel = "models/res34_backbone_100epochs_256x192_compiled.hdf5"
+
+    year_hasil = st.text_input("Tahun", placeholder="mis. 2021",
+                           key=f"year_hasil_{st.session_state.hasil_nonce}") 
+    uploaded2 = st.file_uploader("Upload citra (TIF/JP2)", type=["tif","tiff","jp2"],
+                             accept_multiple_files=False,
+                             key=f"uploader_hasil_{st.session_state.hasil_nonce}")
+    process2 = st.button("Proses Pengujian Baru", type="primary", use_container_width=True, key="process_hasil")
+
+    if process2:
+        if uploaded2 is None:
+            st.error("Silakan upload 1 file citra terlebih dahulu.")
+            st.stop()
+        with st.spinner("Inferensi berjalan..."):
+            res_new = run_pipeline(uploaded2.getbuffer(), uploaded2.name, st.session_state.model_sel)
+            yr2 = (st.session_state.get("year_hasil", "") or "").strip()                # BARU
+            res_new["year"] = int(yr2) if yr2.isdigit() else None                       # BARU
+            yr2 = (year_hasil or "").strip()                          # BARU
+        res_new["year"] = yr2 if yr2 else None                    # BARU
+        st.session_state["results"].append(res_new)
+        # BARU: reset field dengan memaksa remount widget
+        st.session_state["hasil_nonce"] += 1                      # BARU
+        st.success("Pengujian baru selesai.")
+        st.rerun()
+
+    # === Grafik garis dinamis berdasarkan TAHUN (string) ===  # BARU (perbaikan)
+    st.subheader("Perbandingan Luas Kebun (km²) per Tahun")
+
+    # Kumpulkan (year, area) dari semua hasil yang punya year
+    rows = []
+    for r in results:
+        y = r.get("year")
+        if y is None or str(y).strip() == "":
+            continue
+        try:
+            y_int = int(str(y).strip())
+        except Exception:
+            continue
+        rows.append({"Tahun": y_int, "Luas (km²)": float(r["area_km2"])})
+
+    if rows:
+        df = pd.DataFrame(rows)
+
+        # Jika ada beberapa hasil pada tahun yang sama, kita jumlahkan (total luas per tahun)
+        df_year = (df.groupby("Tahun", as_index=True)["Luas (km²)"]
+                    .sum()
+                    .sort_index()
+                    .reset_index())
+
+        # Grafik garis
+        df_plot = df_year.copy()
+        df_plot["Tahun"] = df_plot["Tahun"].astype(int).astype(str)
+
+        # Jadikan Tahun sebagai index (kategori diskrit), lalu plot
+        df_plot = df_plot.set_index("Tahun")
+        st.line_chart(df_plot["Luas (km²)"])
+
+        # Hitung persentase perubahan year-to-year
+        # %Δ = (tahun_i - tahun_(i-1)) / tahun_(i-1) * 100
+        df_year["%Δ vs tahun sebelumnya"] = df_year["Luas (km²)"].pct_change() * 100.0
+
+        # Buat tabel pasangan periode, mis. 2023→2024, 2024→2025
+        pairs = []
+        for i in range(1, len(df_year)):
+            y_prev = int(df_year.loc[i-1, "Tahun"])
+            y_curr = int(df_year.loc[i,   "Tahun"])
+            v_prev = float(df_year.loc[i-1, "Luas (km²)"])
+            v_curr = float(df_year.loc[i,   "Luas (km²)"])
+            if v_prev == 0:
+                pct = None
+            else:
+                pct = (v_curr - v_prev) / v_prev * 100.0
+            pairs.append({
+                "Periode": f"{y_prev}→{y_curr}",
+                "Luas Tahun Awal (km²)": v_prev,
+                "Luas Tahun Akhir (km²)": v_curr,
+                "Persentase Perubahan": pct
+            })
+
+        # Tabel persentase perubahan antar tahun
+        if pairs:
+            df_pairs = pd.DataFrame(pairs)
+
+            # Format tampilan persentase agar rapi (+/− dan 2 desimal)
+            def fmt_pct(x):
+                return "—" if x is None or pd.isna(x) else f"{x:+.2f}%"
+
+            df_pairs_display = df_pairs.copy()
+            df_pairs_display["Persentase Perubahan"] = df_pairs_display["Persentase Perubahan"].apply(fmt_pct)
+            st.subheader("Persentase Perubahan Antar Tahun")
+            st.dataframe(df_pairs_display, use_container_width=True)
+
+            # Perubahan total dari tahun pertama ke terakhir (mis. 2023→2025)
+            first_year = int(df_year.iloc[0]["Tahun"])
+            last_year  = int(df_year.iloc[-1]["Tahun"])
+            first_val  = float(df_year.iloc[0]["Luas (km²)"])
+            last_val   = float(df_year.iloc[-1]["Luas (km²)"])
+            if first_val == 0:
+                total_pct = None
+            else:
+                total_pct = (last_val - first_val) / first_val * 100.0
+
+            abs_change = last_val - first_val
+
+            # Tampilkan metric ringkas
+            st.metric(
+                label=f"Perubahan Total {first_year}→{last_year}",
+                value=f"{abs_change:.4f} km²",
+                delta=("—" if total_pct is None else f"{total_pct:+.2f}%")
+            )
+
+        else:
+            st.info("Butuh minimal dua tahun berbeda untuk menghitung persentase perubahan.")
+
+    else:
+        st.info("Masukkan tahun pada form agar grafik dan persentase dapat ditampilkan.")
+
+
+
+
     st.divider()
-    st.subheader("Luas Area Kebun Kelapa Sawit Terdeteksi")
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("Jumlah piksel positif", f"{res['n_pixels_pos']:,}")
-    with c2:
-        st.metric("Luas/piksel", f"{res['pixel_area_m2']:.2f} m²")
-    with c3:
-        st.metric("Luas total (ha)", f"{res['area_ha']:.2f} ha")
-    with c4:
-        st.metric("Luas total (km²)", f"{res['area_km2']:.4f} km²")
+    # ================== TAMPILKAN SEMUA HASIL PENGUJIAN ==================
+    for idx, res in enumerate(results, start=1):
+        st.markdown(f"### Pengujian {idx} — *{res.get('filename','(tanpa nama)')}*")
+        cA, cB = st.columns(2)
+        with cA:
+            st.subheader("Citra asli (preview)")
+            st.image(res["png_rgb_bytes"], use_container_width=True)
+        with cB:
+            st.subheader("Overlay")
+            st.image(res["png_ovr_bytes"], use_container_width=True)
 
-    st.caption(f"≈ {res['area_m2']:,.2f} m² total (dihitung dari {res['n_pixels_pos']:,} piksel × {res['pixel_area_m2']:.2f} m²/piksel).")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.caption("Merah = bukan area kebun kelapa sawit")
+        with col2:
+            st.caption("Hijau = area kebun kelapa sawit")
 
-    st.divider()
-    st.download_button(
-        "Unduh hasil (mask tif + shapefile + overlay PNG + input asli)",
-        data=res["zip_bytes"],
-        file_name=res["zip_name"],
-        mime="application/zip",
-        use_container_width=True
-    )
-    if st.button("Kembali ke Pengujian", use_container_width=True):
+        # metrik luas untuk masing-masing pengujian
+        st.subheader("Luas Area Kebun Kelapa Sawit Terdeteksi")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Jumlah piksel positif", f"{res['n_pixels_pos']:,}")
+        m2.metric("Luas/piksel", f"{res['pixel_area_m2']:.2f} m²")
+        m3.metric("Luas total (ha)", f"{res['area_ha']:.2f} ha")
+        m4.metric("Luas total (km²)", f"{res['area_km2']:.4f} km²")
+
+        st.caption(f"≈ {res['area_m2']:,.2f} m² total (dihitung dari {res['n_pixels_pos']:,} piksel × {res['pixel_area_m2']:.2f} m²/piksel).")
+
+                # ================== BARIS BARU: BUKAN KEBUN SAWIT ==================
+        st.subheader("Luas Area BUKAN Kebun Kelapa Sawit")
+        n_np = res.get("n_pixels_nonpalm", None)
+
+        if n_np is not None:
+            n_valid = res.get("n_pixels_valid", n_np + res["n_pixels_pos"])
+            m5, m6, m7, m8 = st.columns(4)
+            m5.metric("Jumlah piksel negatif", f"{n_np:,}")
+            m6.metric("Luas/piksel", f"{res['pixel_area_m2']:.2f} m²")
+            m7.metric("Luas total (ha)", f"{res['area_nonpalm_ha']:.2f} ha")
+            m8.metric("Luas total (km²)", f"{res['area_nonpalm_km2']:.4f} km²")
+
+            st.caption(
+                f"≈ {res['area_nonpalm_m2']:,.2f} m² total "
+                f"(dihitung dari {n_np:,} piksel × {res['pixel_area_m2']:.2f} m²/piksel"
+            )
+        else:
+            st.info("Statistik area bukan kebun sawit tidak tersedia untuk hasil ini.")
+
+
+        # tombol unduh per pengujian
+        st.download_button(
+            "Unduh hasil (mask tif + shapefile + overlay PNG + input asli)",
+            data=res["zip_bytes"],
+            file_name=res["zip_name"],
+            mime="application/zip",
+            use_container_width=True,
+            key=f"dl_zip_{idx}"
+        )
+        st.divider()
+
+    # navigasi kembali
+    if st.button("⬅️ Ke Pengujian", use_container_width=True, key="back_to_pengujian_from_hasil"):
         st.query_params["view"] = "pengujian"
         st.rerun()
+
 
 # ---------- HALAMAN: USER MANUAL ----------
 elif view == "manual":
